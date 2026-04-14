@@ -1,21 +1,20 @@
 name: Extraction Centris — 7h00 chaque matin
 
 on:
-  # Planification automatique
-  # EST (hiver, UTC-5) : 7h00 = 12h00 UTC  → cron "0 12 * 11,12,1,2,3 *"
-  # EDT (été,  UTC-4) : 7h00 = 11h00 UTC  → cron "0 11 * 4,5,6,7,8,9,10 *"
+  # EST (hiver, UTC-5) : 7h00 = 12h00 UTC
+  # EDT (été,  UTC-4) : 7h00 = 11h00 UTC
   schedule:
-    - cron: "0 12 * 11,12,1,2,3 *"   # Hiver (nov → mars) : 7h00 EST
-    - cron: "0 11 * 4,5,6,7,8,9,10 *" # Été   (avr → oct) : 7h00 EDT
+    - cron: "0 12 * 11,12,1,2,3 *"    # Hiver (nov → mars) : 7h00 EST
+    - cron: "0 11 * 4,5,6,7,8,9,10 *"  # Été   (avr → oct) : 7h00 EDT
 
-  # Permet aussi de lancer manuellement depuis l'onglet Actions de GitHub
+  # Lancement manuel depuis l'onglet Actions de GitHub
   workflow_dispatch:
 
 jobs:
   extract:
-    name: Extraire les plex et envoyer le rapport
+    name: Extraire les plex et envoyer le rapport si changements
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # sécurité — tue le job si bloqué > 90 min
+    timeout-minutes: 90
 
     steps:
       # 1. Télécharger le code du dépôt
@@ -29,10 +28,19 @@ jobs:
           python-version: "3.11"
 
       # 3. Installer les dépendances
-      - name: Installer openpyxl
+      - name: Installer les dépendances
         run: pip install -r requirements.txt
 
-      # 4. Lancer le script d'extraction + envoi email
+      # 4. Télécharger la référence du run précédent (IDs + prix de la veille)
+      #    continue-on-error: true → OK si premier run (fichier absent)
+      - name: Télécharger référence de la veille
+        uses: actions/download-artifact@v4
+        with:
+          name: listing-ids-reference
+          path: .
+        continue-on-error: true
+
+      # 5. Lancer l'extraction + détection des changements + email conditionnel
       - name: Lancer extraction_50km.py
         env:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
@@ -40,12 +48,22 @@ jobs:
           EMAIL_DEST:         ${{ secrets.EMAIL_DEST }}
         run: python extraction_50km.py
 
-      # 5. Sauvegarder le fichier Excel comme artefact GitHub (30 jours)
-      #    Accessible dans l'onglet Actions → workflow run → Artifacts
+      # 6. Sauvegarder le fichier Excel comme artefact GitHub (30 jours)
       - name: Sauvegarder le fichier Excel
-        if: always()   # sauvegarde même si l'email échoue
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: plex-sherbrooke-50km-${{ github.run_number }}
           path: plex_sherbrooke_50km.xlsx
           retention-days: 30
+
+      # 7. Sauvegarder la référence pour le run de demain
+      #    overwrite: true → remplace l'artefact précédent (toujours 1 seul artefact de référence)
+      - name: Sauvegarder référence pour demain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: listing-ids-reference
+          path: listing_ids_precedents.json
+          overwrite: true
+          retention-days: 2
