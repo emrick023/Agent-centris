@@ -1,0 +1,51 @@
+name: Extraction Centris — 7h00 chaque matin
+
+on:
+  # Planification automatique
+  # EST (hiver, UTC-5) : 7h00 = 12h00 UTC  → cron "0 12 * 11,12,1,2,3 *"
+  # EDT (été,  UTC-4) : 7h00 = 11h00 UTC  → cron "0 11 * 4,5,6,7,8,9,10 *"
+  schedule:
+    - cron: "0 12 * 11,12,1,2,3 *"   # Hiver (nov → mars) : 7h00 EST
+    - cron: "0 11 * 4,5,6,7,8,9,10 *" # Été   (avr → oct) : 7h00 EDT
+
+  # Permet aussi de lancer manuellement depuis l'onglet Actions de GitHub
+  workflow_dispatch:
+
+jobs:
+  extract:
+    name: Extraire les plex et envoyer le rapport
+    runs-on: ubuntu-latest
+    timeout-minutes: 90   # sécurité — tue le job si bloqué > 90 min
+
+    steps:
+      # 1. Télécharger le code du dépôt
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      # 2. Configurer Python 3.11
+      - name: Configurer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Installer les dépendances
+      - name: Installer openpyxl
+        run: pip install -r requirements.txt
+
+      # 4. Lancer le script d'extraction + envoi email
+      - name: Lancer extraction_50km.py
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_DEST:         ${{ secrets.EMAIL_DEST }}
+        run: python extraction_50km.py
+
+      # 5. Sauvegarder le fichier Excel comme artefact GitHub (30 jours)
+      #    Accessible dans l'onglet Actions → workflow run → Artifacts
+      - name: Sauvegarder le fichier Excel
+        if: always()   # sauvegarde même si l'email échoue
+        uses: actions/upload-artifact@v4
+        with:
+          name: plex-sherbrooke-50km-${{ github.run_number }}
+          path: plex_sherbrooke_50km.xlsx
+          retention-days: 30

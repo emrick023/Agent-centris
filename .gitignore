@@ -1,0 +1,26 @@
+# Fichiers générés par le script
+plex_sherbrooke_50km.xlsx
+sessions/*.xlsx
+
+# Fichiers temporaires Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Fichiers de travail intermédiaires
+decode_q.py
