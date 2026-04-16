@@ -31,14 +31,15 @@ jobs:
       - name: Installer les dépendances
         run: pip install -r requirements.txt
 
-      # 4. Télécharger la référence du run précédent (IDs + prix de la veille)
-      #    continue-on-error: true → OK si premier run (fichier absent)
-      - name: Télécharger référence de la veille
-        uses: actions/download-artifact@v4
+      # 4. Restaurer la référence de la veille (persistée via cache inter-runs)
+      #    Si aucune cache n'existe encore, le script traite ce run comme "premier run".
+      - name: Restaurer référence de la veille
+        uses: actions/cache/restore@v4
         with:
-          name: listing-ids-reference
-          path: .
-        continue-on-error: true
+          path: listing_ids_precedents.json
+          key: listing-ref-${{ github.run_id }}
+          restore-keys: |
+            listing-ref-
 
       # 5. Lancer l'extraction + détection des changements + email conditionnel
       - name: Lancer extraction_50km.py
@@ -57,13 +58,10 @@ jobs:
           path: plex_sherbrooke_50km.xlsx
           retention-days: 30
 
-      # 7. Sauvegarder la référence pour le run de demain
-      #    overwrite: true → remplace l'artefact précédent (toujours 1 seul artefact de référence)
+      # 7. Sauvegarder la référence pour le run de demain (cache inter-runs)
       - name: Sauvegarder référence pour demain
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: listing-ids-reference
           path: listing_ids_precedents.json
-          overwrite: true
-          retention-days: 2
+          key: listing-ref-${{ github.run_id }}
