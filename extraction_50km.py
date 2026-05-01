@@ -16,6 +16,7 @@ Usage GitHub Actions : le workflow injecte automatiquement les variables.
 
 import urllib.request
 import urllib.error
+import urllib.parse
 import re
 import time
 import os
@@ -24,6 +25,7 @@ import json
 import html as html_module
 import smtplib
 import datetime
+import unicodedata
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -99,6 +101,13 @@ CLR_NOUVEAU     = "C6EFCE"   # vert  — nouvelle annonce
 CLR_PRIX_LIGNE  = "FFEB9C"   # jaune — changement de prix (ligne)
 CLR_PRIX_CELL   = "FF6600"   # orange — changement de prix (cellule Prix)
 
+# Garde-fous contre les extractions partielles: si Centris ou le réseau
+# retourne une fraction inhabituelle des annonces, on évite de polluer la
+# référence de demain et d'envoyer un rapport trompeur.
+MAX_REMOVED_RATIO_FOR_SAFE_RUN = 0.20
+MIN_ACTIVE_RATIO_FOR_SAFE_RUN  = 0.80
+MAX_REMOVED_COUNT_FOR_SAFE_RUN = 15
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -136,6 +145,35 @@ LISTING_RE    = re.compile(
 NB_RESULTS_RE = re.compile(r'<span\s+id="numberOfResults"\s*>(\d+)<', re.IGNORECASE)
 
 
+def hidden_span_value(html, span_id):
+    pat = re.compile(
+        r'<span\s+id="' + re.escape(span_id) + r'"\s*>(.*?)</span>',
+        re.DOTALL | re.IGNORECASE
+    )
+    m = pat.search(html)
+    return html_module.unescape(m.group(1)).strip() if m else ""
+
+
+def build_stable_page_url(base, first_page_html, page):
+    """
+    Centris shuffles result pages unless the run's sortSeed is reused.
+    Keeping the seed prevents overlapping pages and false "new" listings.
+    """
+    params = {
+        "sort": hidden_span_value(first_page_html, "currentSort"),
+        "sortSeed": hidden_span_value(first_page_html, "sortSeed"),
+        "pageSize": hidden_span_value(first_page_html, "pageSize") or str(PAGE_SIZE),
+        "q": hidden_span_value(first_page_html, "serializedSearchQuery"),
+        "page": str(page),
+    }
+    params = {key: val for key, val in params.items() if val}
+
+    if not params.get("sortSeed"):
+        return f"{base}?page={page}"
+
+    return f"{base}?{urllib.parse.urlencode(params)}"
+
+
 def get_listing_urls_for_ville(ville_nom, ville_slug):
     results = {}
     base    = f"{BASE_URL}/fr/plex~a-vendre~{ville_slug}"
@@ -155,8 +193,10 @@ def get_listing_urls_for_ville(ville_nom, ville_slug):
         if lid not in results:
             results[lid] = BASE_URL + m.group(1)
 
+    first_page_html = html
+
     for page in range(2, nb_pages + 1):
-        url = f"{base}?page={page}"
+        url = build_stable_page_url(base, first_page_html, page)
         print(f"    Page {page}/{nb_pages} : {url}")
         time.sleep(DELAY_PAGES)
         html = fetch(url)
@@ -166,6 +206,12 @@ def get_listing_urls_for_ville(ville_nom, ville_slug):
             lid = m.group(2)
             if lid not in results:
                 results[lid] = BASE_URL + m.group(1)
+
+    if total and len(results) < total:
+        print(
+            "    [AVERTISSEMENT] Résultats incomplets : "
+            f"{len(results)}/{total} annonces uniques collectées."
+        )
 
     return results
 
@@ -185,14 +231,27 @@ def clean_number(text):
     return int(digits) if digits else "Non indiqué"
 
 
+def normalize_label(text):
+    text = decode_html(re.sub(r'<[^>]+>', ' ', text))
+    text = text.replace("’", "'").lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9']+", " ", text).strip()
+
+
 def carac_value(html, label):
+    expected = normalize_label(label)
     pat = re.compile(
-        re.escape(label) + r'.*?</div>\s*<div class="carac-value"[^>]*>'
-        r'<span[^>]*>(.*?)</span>',
+        r'<div class="carac-title"[^>]*>(.*?)</div>\s*'
+        r'<div class="carac-value"[^>]*>\s*<span[^>]*>(.*?)</span>',
         re.DOTALL | re.IGNORECASE
     )
-    m = pat.search(html)
-    return decode_html(m.group(1)) if m else "Non indiqué"
+
+    for title, value in pat.findall(html):
+        if normalize_label(title) == expected:
+            return decode_html(value)
+
+    return "Non indiqué"
 
 
 def financial_total(html, section_label):
@@ -230,16 +289,16 @@ def extract_listing(url, ville_nom):
     prix_m      = re.search(r'<meta\s+itemprop="price"\s+content="(\d+)"', html, re.IGNORECASE)
     data["Prix"] = int(prix_m.group(1)) if prix_m else "Non indiqué"
 
-    nb_raw = carac_value(html, "Nombre d")
+    nb_raw = carac_value(html, "Nombre d'unités")
     if nb_raw != "Non indiqué":
         nb_m = re.search(r'(\d+)', nb_raw)
         data["Nombre d'unités"] = int(nb_m.group(1)) if nb_m else "Non indiqué"
     else:
         data["Nombre d'unités"] = "Non indiqué"
 
-    data["Unités résidentielles"] = carac_value(html, "nités résidentielles")
+    data["Unités résidentielles"] = carac_value(html, "Unités résidentielles")
 
-    annee_raw = carac_value(html, "de construction")
+    annee_raw = carac_value(html, "Année de construction")
     if annee_raw != "Non indiqué":
         annee_m = re.search(r'(\d{4})', annee_raw)
         yr      = int(annee_m.group(1)) if annee_m else None
@@ -339,6 +398,47 @@ def detect_changements(rows, ref):
                 prix_changes[lid] = ancien_prix
 
     return nouveaux_ids, retires, prix_changes
+
+
+def is_reference_update_safe(rows, ref, retires):
+    """
+    Retourne False si l'extraction ressemble à un run partiel.
+
+    Sans ce garde-fou, une page Centris manquée aujourd'hui efface des annonces
+    de la référence, puis ces mêmes annonces reviennent demain comme faux
+    "nouveaux" plex.
+    """
+    if not ref:
+        return True
+
+    previous_count = len(ref)
+    current_count  = len(rows)
+    removed_count  = len(retires)
+
+    if previous_count == 0:
+        return True
+
+    active_ratio  = current_count / previous_count
+    removed_ratio = removed_count / previous_count
+    max_removed   = max(MAX_REMOVED_COUNT_FOR_SAFE_RUN,
+                        int(previous_count * MAX_REMOVED_RATIO_FOR_SAFE_RUN))
+
+    if active_ratio < MIN_ACTIVE_RATIO_FOR_SAFE_RUN:
+        print(
+            "[SÉCURITÉ] Extraction suspecte : "
+            f"{current_count}/{previous_count} annonces actives "
+            f"({active_ratio:.0%})."
+        )
+        return False
+
+    if removed_count > max_removed or removed_ratio > MAX_REMOVED_RATIO_FOR_SAFE_RUN:
+        print(
+            "[SÉCURITÉ] Trop d'annonces retirées en un run : "
+            f"{removed_count}/{previous_count} ({removed_ratio:.0%})."
+        )
+        return False
+
+    return True
 
 # ---------------------------------------------------------------------------
 # EXCEL
@@ -459,7 +559,7 @@ def _fmt_prix(prix):
 def send_email(excel_path, nb_total, nouveaux, retires, prix_changes, rows_dict):
     """
     Envoie l'email uniquement si des changements ont été détectés.
-    rows_dict : {listing_id: row_data} pour retrouver adresse/ville des nouveaux/prix changés.
+    rows_dict est conservé pour compatibilité avec l'appelant.
     """
     if not GMAIL_USER or not GMAIL_APP_PASSWORD or not EMAIL_DEST:
         print("[EMAIL] Variables d'environnement manquantes — email non envoyé.")
@@ -479,43 +579,17 @@ def send_email(excel_path, nb_total, nouveaux, retires, prix_changes, rows_dict)
         f"(+{nb_nouveaux} / -{nb_retires} / ~{nb_prix} prix)"
     )
 
-    # Corps de l'email
+    # Corps de l'email: résumé seulement, les détails restent dans l'Excel.
     lignes = [
         f"Bonjour,",
         f"",
         f"Des modifications ont été détectées sur Centris ce matin ({today}).",
         f"",
-    ]
-
-    if nb_nouveaux:
-        lignes.append(f"NOUVELLES ANNONCES ({nb_nouveaux})")
-        for lid in nouveaux:
-            row = rows_dict.get(lid, {})
-            lignes.append(
-                f"  • {row.get('Adresse', 'Adresse inconnue')}"
-                f" — {row.get('Ville', '')}"
-                f" — {_fmt_prix(row.get('Prix', '?'))}"
-            )
-        lignes.append("")
-
-    if nb_retires:
-        lignes.append(f"ANNONCES RETIRÉES ({nb_retires})")
-        for r in retires:
-            lignes.append(f"  • {r['adresse']} — {r['ville']}")
-        lignes.append("")
-
-    if nb_prix:
-        lignes.append(f"CHANGEMENTS DE PRIX ({nb_prix})")
-        for lid, ancien_prix in prix_changes.items():
-            row = rows_dict.get(lid, {})
-            lignes.append(
-                f"  • {row.get('Adresse', 'Adresse inconnue')}"
-                f" — {row.get('Ville', '')}"
-                f"   {_fmt_prix(ancien_prix)} → {_fmt_prix(row.get('Prix', '?'))}"
-            )
-        lignes.append("")
-
-    lignes += [
+        f"Résumé des changements :",
+        f"  Nouvelles annonces  : {nb_nouveaux}",
+        f"  Annonces retirées   : {nb_retires}",
+        f"  Changements de prix : {nb_prix}",
+        f"",
         f"Total actuel : {nb_total} annonces",
         f"",
         f"Le fichier Excel complet est joint (lignes colorées selon les changements).",
@@ -566,6 +640,7 @@ def main():
     # Étape 0 : charger la référence de la veille
     print("\n[ÉTAPE 0] Chargement de la référence de la veille...")
     ref = load_reference(REFERENCE_PATH)
+    baseline_only = not ref
 
     # Étape 1 : collecter tous les liens
     print("\n[ÉTAPE 1] Collecte des liens d'annonces par ville...")
@@ -603,9 +678,17 @@ def main():
     print("\n[ÉTAPE 3] Détection des changements...")
     nouveaux_ids, retires, prix_changes = detect_changements(rows, ref)
 
+    if baseline_only:
+        print("  Aucune référence exploitable : création d'une baseline, sans faux nouveaux.")
+        nouveaux_ids = set()
+        retires      = []
+        prix_changes = {}
+
     print(f"  Nouvelles annonces  : {len(nouveaux_ids)}")
     print(f"  Annonces retirées   : {len(retires)}")
     print(f"  Changements de prix : {len(prix_changes)}")
+
+    safe_reference_update = is_reference_update_safe(rows, ref, retires)
 
     # Étape 4 : générer l'Excel (annonces actives uniquement — retirées exclues)
     print("\n[ÉTAPE 4] Génération du fichier Excel...")
@@ -614,19 +697,25 @@ def main():
 
     # Étape 5 : sauvegarder la nouvelle référence
     print("\n[ÉTAPE 5] Sauvegarde de la référence pour demain...")
-    save_reference(rows_actifs, REFERENCE_PATH)
+    if safe_reference_update:
+        save_reference(rows_actifs, REFERENCE_PATH)
+    else:
+        print("[SÉCURITÉ] Référence conservée : le run actuel semble partiel.")
 
     # Étape 6 : envoyer l'email si changements détectés
     print("\n[ÉTAPE 6] Envoi de l'email (si changements)...")
     rows_dict = {r["_id"]: r for r in rows if r.get("_id")}
-    send_email(
-        excel_path   = OUTPUT_PATH,
-        nb_total     = len(rows_actifs),
-        nouveaux     = nouveaux_ids,
-        retires      = retires,
-        prix_changes = prix_changes,
-        rows_dict    = rows_dict,
-    )
+    if safe_reference_update:
+        send_email(
+            excel_path   = OUTPUT_PATH,
+            nb_total     = len(rows_actifs),
+            nouveaux     = nouveaux_ids,
+            retires      = retires,
+            prix_changes = prix_changes,
+            rows_dict    = rows_dict,
+        )
+    else:
+        print("[EMAIL] Email non envoyé : extraction suspecte, rapport non fiable.")
 
     print("\nTerminé.")
 
