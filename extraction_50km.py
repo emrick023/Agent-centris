@@ -114,19 +114,19 @@ MAX_REMOVED_COUNT_FOR_SAFE_RUN = 10
 # HTTP
 # ---------------------------------------------------------------------------
 
-def fetch(url, retries=3):
+def fetch_response(url, retries=3):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=25) as resp:
                 raw = resp.read()
                 try:
-                    return raw.decode("utf-8")
+                    return raw.decode("utf-8"), resp.status
                 except UnicodeDecodeError:
-                    return raw.decode("latin-1", errors="replace")
+                    return raw.decode("latin-1", errors="replace"), resp.status
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                return ""
+                return "", 404
             print(f"    [HTTP {e.code}] {url}")
             if attempt < retries - 1:
                 time.sleep(2)
@@ -134,17 +134,26 @@ def fetch(url, retries=3):
             print(f"    [ERREUR] {url} → {e}")
             if attempt < retries - 1:
                 time.sleep(2)
-    return ""
+    return "", None
+
+
+def fetch(url, retries=3):
+    html, _status = fetch_response(url, retries)
+    return html
 
 # ---------------------------------------------------------------------------
 # COLLECTE DES LIENS
 # ---------------------------------------------------------------------------
 
 LISTING_RE    = re.compile(
-    r'href="(/fr/(?:duplex|triplex|quadruplex|quintuplex|plex)~a-vendre~[^"/]+/(\d{7,}))"',
+    r'href="((?:https://www\.centris\.ca)?/fr/(?:duplex|triplex|quadruplex|quintuplex|plex)~a-vendre~[^"/]+/(\d{7,}))"',
     re.IGNORECASE
 )
 NB_RESULTS_RE = re.compile(r'<span\s+id="numberOfResults"\s*>(\d+)<', re.IGNORECASE)
+
+
+def absolute_listing_url(href):
+    return href if href.startswith("http") else BASE_URL + href
 
 
 def hidden_span_value(html, span_id):
@@ -185,10 +194,13 @@ def get_listing_urls_for_ville(ville_nom, ville_slug, return_stats=False):
     base    = f"{BASE_URL}/fr/plex~a-vendre~{ville_slug}"
     stats   = {"expected": 0, "collected": 0, "complete": True}
 
-    html = fetch(base)
+    html, status = fetch_response(base)
     if not html:
-        stats["complete"] = False
-        print("    → Aucune réponse (ville absente de Centris ou erreur réseau)")
+        if status == 404:
+            print("    → Ville absente de Centris (0 annonce)")
+        else:
+            stats["complete"] = False
+            print("    → Aucune réponse (erreur réseau ou Centris indisponible)")
         return (results, stats) if return_stats else results
 
     nb_m     = NB_RESULTS_RE.search(html)
@@ -200,7 +212,7 @@ def get_listing_urls_for_ville(ville_nom, ville_slug, return_stats=False):
     for m in LISTING_RE.finditer(html):
         lid = m.group(2)
         if lid not in results:
-            results[lid] = BASE_URL + m.group(1)
+            results[lid] = absolute_listing_url(m.group(1))
 
     first_page_html = html
 
@@ -214,7 +226,7 @@ def get_listing_urls_for_ville(ville_nom, ville_slug, return_stats=False):
         for m in LISTING_RE.finditer(html):
             lid = m.group(2)
             if lid not in results:
-                results[lid] = BASE_URL + m.group(1)
+                results[lid] = absolute_listing_url(m.group(1))
 
     if total and len(results) < total:
         stats["complete"] = False

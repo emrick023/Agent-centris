@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -121,6 +122,54 @@ class PaginationTests(unittest.TestCase):
         self.assertIn("sortSeed=123456", url)
         self.assertIn("pageSize=20", url)
         self.assertIn("page=2", url)
+
+
+class ListingCollectionTests(unittest.TestCase):
+    def test_collects_absolute_and_relative_listing_urls(self):
+        html = """
+        <span id="numberOfResults">2</span>
+        <a href="https://www.centris.ca/fr/duplex~a-vendre~weedon/20726770">A</a>
+        <a href="/fr/triplex~a-vendre~sherbrooke/12345678">B</a>
+        """
+
+        with patch.object(extraction, "fetch_response", return_value=(html, 200)):
+            results, stats = extraction.get_listing_urls_for_ville(
+                "Test",
+                "test",
+                return_stats=True,
+            )
+
+        self.assertEqual(stats, {"expected": 2, "collected": 2, "complete": True})
+        self.assertEqual(
+            results["20726770"],
+            "https://www.centris.ca/fr/duplex~a-vendre~weedon/20726770",
+        )
+        self.assertEqual(
+            results["12345678"],
+            "https://www.centris.ca/fr/triplex~a-vendre~sherbrooke/12345678",
+        )
+
+    def test_404_city_is_treated_as_empty_not_incomplete(self):
+        with patch.object(extraction, "fetch_response", return_value=("", 404)):
+            results, stats = extraction.get_listing_urls_for_ville(
+                "Missing",
+                "missing",
+                return_stats=True,
+            )
+
+        self.assertEqual(results, {})
+        self.assertEqual(stats, {"expected": 0, "collected": 0, "complete": True})
+
+    def test_network_failure_is_incomplete(self):
+        with patch.object(extraction, "fetch_response", return_value=("", None)):
+            results, stats = extraction.get_listing_urls_for_ville(
+                "Broken",
+                "broken",
+                return_stats=True,
+            )
+
+        self.assertEqual(results, {})
+        self.assertEqual(stats, {"expected": 0, "collected": 0, "complete": False})
 
 
 class UnitCountTests(unittest.TestCase):
