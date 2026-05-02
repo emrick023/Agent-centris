@@ -9,6 +9,15 @@ on:
 
   # Lancement manuel depuis l'onglet Actions de GitHub
   workflow_dispatch:
+    inputs:
+      reset_reference:
+        description: "Reconstruire la référence sans envoyer d'alerte"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 jobs:
   extract:
@@ -37,9 +46,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: listing_ids_precedents.json
-          key: listing-ref-${{ github.run_id }}
+          key: listing-ref-v2-${{ github.run_id }}
           restore-keys: |
-            listing-ref-
+            listing-ref-v2-
 
       # 5. Lancer l'extraction + détection des changements + email conditionnel
       - name: Lancer extraction_50km.py
@@ -47,6 +56,7 @@ jobs:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_DEST:         ${{ secrets.EMAIL_DEST }}
+          RESET_REFERENCE:    ${{ github.event.inputs.reset_reference || 'false' }}
         run: python extraction_50km.py
 
       # 6. Sauvegarder le fichier Excel comme artefact GitHub (30 jours)
@@ -64,4 +74,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: listing_ids_precedents.json
-          key: listing-ref-${{ github.run_id }}
+          key: listing-ref-v2-${{ github.run_id }}

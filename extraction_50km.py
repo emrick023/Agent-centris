@@ -26,6 +26,7 @@ import html as html_module
 import smtplib
 import datetime
 import unicodedata
+import argparse
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -51,6 +52,7 @@ REFERENCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 GMAIL_USER         = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 EMAIL_DEST         = os.environ.get("EMAIL_DEST", "")
+RESET_REFERENCE    = os.environ.get("RESET_REFERENCE", "").lower() in {"1", "true", "yes"}
 
 VILLES = [
     ("Sherbrooke",                        "sherbrooke"),
@@ -104,9 +106,9 @@ CLR_PRIX_CELL   = "FF6600"   # orange — changement de prix (cellule Prix)
 # Garde-fous contre les extractions partielles: si Centris ou le réseau
 # retourne une fraction inhabituelle des annonces, on évite de polluer la
 # référence de demain et d'envoyer un rapport trompeur.
-MAX_REMOVED_RATIO_FOR_SAFE_RUN = 0.20
-MIN_ACTIVE_RATIO_FOR_SAFE_RUN  = 0.80
-MAX_REMOVED_COUNT_FOR_SAFE_RUN = 15
+MAX_REMOVED_RATIO_FOR_SAFE_RUN = 0.10
+MIN_ACTIVE_RATIO_FOR_SAFE_RUN  = 0.90
+MAX_REMOVED_COUNT_FOR_SAFE_RUN = 10
 
 # ---------------------------------------------------------------------------
 # HTTP
@@ -159,8 +161,12 @@ def build_stable_page_url(base, first_page_html, page):
     Centris shuffles result pages unless the run's sortSeed is reused.
     Keeping the seed prevents overlapping pages and false "new" listings.
     """
+    current_sort = hidden_span_value(first_page_html, "currentSort")
+    if not current_sort or current_sort.lower() == "none":
+        current_sort = "DateDesc"
+
     params = {
-        "sort": hidden_span_value(first_page_html, "currentSort"),
+        "sort": current_sort,
         "sortSeed": hidden_span_value(first_page_html, "sortSeed"),
         "pageSize": hidden_span_value(first_page_html, "pageSize") or str(PAGE_SIZE),
         "q": hidden_span_value(first_page_html, "serializedSearchQuery"),
@@ -174,17 +180,20 @@ def build_stable_page_url(base, first_page_html, page):
     return f"{base}?{urllib.parse.urlencode(params)}"
 
 
-def get_listing_urls_for_ville(ville_nom, ville_slug):
+def get_listing_urls_for_ville(ville_nom, ville_slug, return_stats=False):
     results = {}
     base    = f"{BASE_URL}/fr/plex~a-vendre~{ville_slug}"
+    stats   = {"expected": 0, "collected": 0, "complete": True}
 
     html = fetch(base)
     if not html:
+        stats["complete"] = False
         print("    → Aucune réponse (ville absente de Centris ou erreur réseau)")
-        return results
+        return (results, stats) if return_stats else results
 
     nb_m     = NB_RESULTS_RE.search(html)
     total    = int(nb_m.group(1)) if nb_m else 0
+    stats["expected"] = total
     nb_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     print(f"    Total annonces : {total}  ({nb_pages} page{'s' if nb_pages > 1 else ''})")
 
@@ -208,12 +217,14 @@ def get_listing_urls_for_ville(ville_nom, ville_slug):
                 results[lid] = BASE_URL + m.group(1)
 
     if total and len(results) < total:
+        stats["complete"] = False
         print(
             "    [AVERTISSEMENT] Résultats incomplets : "
             f"{len(results)}/{total} annonces uniques collectées."
         )
 
-    return results
+    stats["collected"] = len(results)
+    return (results, stats) if return_stats else results
 
 # ---------------------------------------------------------------------------
 # EXTRACTION D'UNE FICHE
@@ -275,6 +286,55 @@ def financial_total(html, section_label):
     return clean_number(total_m.group(1)) if total_m else "Non indiqué"
 
 
+def parse_unit_count(text):
+    if not text or text == "Non indiqué":
+        return "Non indiqué"
+    m = re.search(r'(\d+)', str(text))
+    return int(m.group(1)) if m else "Non indiqué"
+
+
+def unit_count_from_url(url):
+    type_counts = {
+        "duplex": 2,
+        "triplex": 3,
+        "quadruplex": 4,
+        "quintuplex": 5,
+    }
+    m = re.search(r'/fr/([^/~]+)~a-vendre~', url, re.IGNORECASE)
+    if not m:
+        return "Non indiqué"
+    return type_counts.get(m.group(1).lower(), "Non indiqué")
+
+
+def unit_count_from_mix(unit_mix):
+    if not unit_mix or unit_mix == "Non indiqué":
+        return "Non indiqué"
+
+    parts = [part.strip() for part in str(unit_mix).split(",") if part.strip()]
+    if not parts:
+        return "Non indiqué"
+
+    total = 0
+    for part in parts:
+        m = re.match(r'^(\d+)\s*x\b', part, re.IGNORECASE)
+        if not m:
+            return "Non indiqué"
+        total += int(m.group(1))
+
+    return total if total else "Non indiqué"
+
+
+def resolve_unit_count(url, raw_count, unit_mix):
+    for candidate in (
+        parse_unit_count(raw_count),
+        unit_count_from_url(url),
+        unit_count_from_mix(unit_mix),
+    ):
+        if candidate != "Non indiqué":
+            return candidate
+    return "Non indiqué"
+
+
 def extract_listing(url, ville_nom):
     html = fetch(url)
     if not html:
@@ -289,14 +349,13 @@ def extract_listing(url, ville_nom):
     prix_m      = re.search(r'<meta\s+itemprop="price"\s+content="(\d+)"', html, re.IGNORECASE)
     data["Prix"] = int(prix_m.group(1)) if prix_m else "Non indiqué"
 
-    nb_raw = carac_value(html, "Nombre d'unités")
-    if nb_raw != "Non indiqué":
-        nb_m = re.search(r'(\d+)', nb_raw)
-        data["Nombre d'unités"] = int(nb_m.group(1)) if nb_m else "Non indiqué"
-    else:
-        data["Nombre d'unités"] = "Non indiqué"
-
     data["Unités résidentielles"] = carac_value(html, "Unités résidentielles")
+    nb_raw = carac_value(html, "Nombre d'unités")
+    data["Nombre d'unités"] = resolve_unit_count(
+        url,
+        nb_raw,
+        data["Unités résidentielles"],
+    )
 
     annee_raw = carac_value(html, "Année de construction")
     if annee_raw != "Non indiqué":
@@ -400,7 +459,13 @@ def detect_changements(rows, ref):
     return nouveaux_ids, retires, prix_changes
 
 
-def is_reference_update_safe(rows, ref, retires):
+def is_reference_update_safe(
+    rows,
+    ref,
+    retires,
+    collection_complete=True,
+    expected_listing_count=None,
+):
     """
     Retourne False si l'extraction ressemble à un run partiel.
 
@@ -408,8 +473,16 @@ def is_reference_update_safe(rows, ref, retires):
     de la référence, puis ces mêmes annonces reviennent demain comme faux
     "nouveaux" plex.
     """
-    if not ref:
-        return True
+    if not collection_complete:
+        print("[SÉCURITÉ] Extraction suspecte : collecte incomplète des résultats.")
+        return False
+
+    if expected_listing_count is not None and len(rows) < expected_listing_count:
+        print(
+            "[SÉCURITÉ] Extraction suspecte : "
+            f"{len(rows)}/{expected_listing_count} fiches extraites."
+        )
+        return False
 
     previous_count = len(ref)
     current_count  = len(rows)
@@ -420,8 +493,6 @@ def is_reference_update_safe(rows, ref, retires):
 
     active_ratio  = current_count / previous_count
     removed_ratio = removed_count / previous_count
-    max_removed   = max(MAX_REMOVED_COUNT_FOR_SAFE_RUN,
-                        int(previous_count * MAX_REMOVED_RATIO_FOR_SAFE_RUN))
 
     if active_ratio < MIN_ACTIVE_RATIO_FOR_SAFE_RUN:
         print(
@@ -431,7 +502,10 @@ def is_reference_update_safe(rows, ref, retires):
         )
         return False
 
-    if removed_count > max_removed or removed_ratio > MAX_REMOVED_RATIO_FOR_SAFE_RUN:
+    if (
+        removed_count > MAX_REMOVED_COUNT_FOR_SAFE_RUN
+        or removed_ratio > MAX_REMOVED_RATIO_FOR_SAFE_RUN
+    ):
         print(
             "[SÉCURITÉ] Trop d'annonces retirées en un run : "
             f"{removed_count}/{previous_count} ({removed_ratio:.0%})."
@@ -632,7 +706,7 @@ def send_email(excel_path, nb_total, nouveaux, retires, prix_changes, rows_dict)
 # MAIN
 # ---------------------------------------------------------------------------
 
-def main():
+def main(reset_reference=False):
     print("=" * 65)
     print("EXTRACTION CENTRIS — PLEX À VENDRE — ~50 KM AUTOUR DE SHERBROOKE")
     print("=" * 65)
@@ -640,15 +714,27 @@ def main():
     # Étape 0 : charger la référence de la veille
     print("\n[ÉTAPE 0] Chargement de la référence de la veille...")
     ref = load_reference(REFERENCE_PATH)
+    if reset_reference:
+        print("[RÉFÉRENCE] Réinitialisation demandée : baseline reconstruite sans alerte.")
+        ref = {}
     baseline_only = not ref
 
     # Étape 1 : collecter tous les liens
     print("\n[ÉTAPE 1] Collecte des liens d'annonces par ville...")
     all_listings = {}   # listing_id → (url, ville_nom)
+    incomplete_villes = []
 
     for ville_nom, ville_slug in VILLES:
         print(f"\n  {ville_nom}")
-        ville_res = get_listing_urls_for_ville(ville_nom, ville_slug)
+        ville_res, ville_stats = get_listing_urls_for_ville(
+            ville_nom,
+            ville_slug,
+            return_stats=True,
+        )
+        if not ville_stats["complete"]:
+            incomplete_villes.append(
+                f"{ville_nom} ({ville_stats['collected']}/{ville_stats['expected']})"
+            )
         for lid, url in ville_res.items():
             if lid not in all_listings:
                 all_listings[lid] = (url, ville_nom)
@@ -673,6 +759,11 @@ def main():
         time.sleep(DELAY_FICHES)
 
     print(f"\n  Fiches extraites avec succès : {len(rows)}")
+    if incomplete_villes:
+        print(
+            "\n  [AVERTISSEMENT] Villes incomplètes : "
+            + ", ".join(incomplete_villes)
+        )
 
     # Étape 3 : détecter les changements
     print("\n[ÉTAPE 3] Détection des changements...")
@@ -688,7 +779,13 @@ def main():
     print(f"  Annonces retirées   : {len(retires)}")
     print(f"  Changements de prix : {len(prix_changes)}")
 
-    safe_reference_update = is_reference_update_safe(rows, ref, retires)
+    safe_reference_update = is_reference_update_safe(
+        rows,
+        ref,
+        retires,
+        collection_complete=not incomplete_villes,
+        expected_listing_count=total,
+    )
 
     # Étape 4 : générer l'Excel (annonces actives uniquement — retirées exclues)
     print("\n[ÉTAPE 4] Génération du fichier Excel...")
@@ -721,4 +818,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extraction Centris plex Sherbrooke.")
+    parser.add_argument(
+        "--reset-reference",
+        action="store_true",
+        help="Reconstruit la référence sans envoyer d'alerte de changements.",
+    )
+    args = parser.parse_args()
+    main(reset_reference=args.reset_reference or RESET_REFERENCE)
