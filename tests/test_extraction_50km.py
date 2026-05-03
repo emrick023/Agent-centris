@@ -9,12 +9,12 @@ sys.path.insert(0, str(ROOT))
 import extraction_50km as extraction
 
 
-def row(listing_id, price=100000):
+def row(listing_id, price=100000, address=None):
     return {
         "_id": listing_id,
         "Prix": price,
         "Ville": "Sherbrooke",
-        "Adresse": f"{listing_id} rue Test",
+        "Adresse": address or f"{listing_id} rue Test",
     }
 
 
@@ -29,30 +29,95 @@ def ref_for(*listing_ids, price=100000):
     }
 
 
+def ref_by_address(*addresses, price=100000, listing_id="10000000"):
+    return {
+        extraction.address_key(address): {
+            "prix": price,
+            "ville": "Sherbrooke",
+            "adresse": address,
+            "listing_id": listing_id,
+        }
+        for address in addresses
+    }
+
+
 class ChangeDetectionTests(unittest.TestCase):
-    def test_detect_changements_tracks_new_removed_and_price_changes(self):
+    def test_detect_changements_tracks_new_removed_and_price_changes_by_address(self):
         rows = [
-            row("10000001", price=100000),
-            row("10000002", price=225000),
-            row("10000003", price=300000),
+            row("10000001", price=100000, address="10, Rue King Ouest"),
+            row("10000002", price=225000, address="20, Rue Queen"),
+            row("10000003", price=300000, address="30, Rue Wellington"),
         ]
-        ref = ref_for("10000001", "10000002", "99999999", price=100000)
+        ref = ref_by_address(
+            "10, Rue King Ouest",
+            "20, Rue Queen",
+            "99, Rue Disparue",
+            price=100000,
+        )
 
         nouveaux, retires, prix_changes = extraction.detect_changements(rows, ref)
 
-        self.assertEqual(nouveaux, {"10000003"})
-        self.assertEqual({item["id"] for item in retires}, {"99999999"})
-        self.assertEqual(prix_changes, {"10000002": 100000})
+        self.assertEqual(nouveaux, {extraction.address_key("30, Rue Wellington")})
+        self.assertEqual(
+            {item["id"] for item in retires},
+            {extraction.address_key("99, Rue Disparue")},
+        )
+        self.assertEqual(
+            prix_changes,
+            {extraction.address_key("20, Rue Queen"): 100000},
+        )
 
-    def test_detect_changements_has_no_false_changes_when_ids_match(self):
-        rows = [row("10000001"), row("10000002")]
-        ref = ref_for("10000001", "10000002")
+    def test_detect_changements_has_no_false_changes_when_address_matches(self):
+        rows = [
+            row("20000001", address="10, Rue King Ouest"),
+            row("20000002", address="20, Rue Queen"),
+        ]
+        ref = ref_by_address("10, Rue King Ouest", "20, Rue Queen")
 
         nouveaux, retires, prix_changes = extraction.detect_changements(rows, ref)
 
         self.assertEqual(nouveaux, set())
         self.assertEqual(retires, [])
         self.assertEqual(prix_changes, {})
+
+    def test_detect_changements_ignores_changed_listing_id_for_same_address(self):
+        rows = [row("22222222", price=100000, address="115 - 117, 11e Avenue Nord")]
+        ref = ref_by_address(
+            "115-117, 11e Avenue Nord",
+            price=100000,
+            listing_id="11111111",
+        )
+
+        nouveaux, retires, prix_changes = extraction.detect_changements(rows, ref)
+
+        self.assertEqual(nouveaux, set())
+        self.assertEqual(retires, [])
+        self.assertEqual(prix_changes, {})
+
+    def test_detect_changements_tracks_price_change_for_same_address_new_id(self):
+        rows = [row("22222222", price=125000, address="115 - 117, 11e Avenue Nord")]
+        ref = ref_by_address(
+            "115-117, 11e Avenue Nord",
+            price=100000,
+            listing_id="11111111",
+        )
+
+        _nouveaux, _retires, prix_changes = extraction.detect_changements(rows, ref)
+
+        self.assertEqual(
+            prix_changes,
+            {extraction.address_key("115 - 117, 11e Avenue Nord"): 100000},
+        )
+
+    def test_address_key_normalizes_accents_spacing_and_punctuation(self):
+        self.assertEqual(
+            extraction.address_key("115 - 117, 11e Avenue Nord, Sherbrooke (Fleurimont)"),
+            extraction.address_key("115-117  11E avenue nord Sherbrooke (Fleurimont)"),
+        )
+        self.assertEqual(
+            extraction.address_key("170, Rue Murray, Sherbrooke (Fleurimont)"),
+            "170 rue murray sherbrooke (fleurimont)",
+        )
 
 
 class SafetyGuardTests(unittest.TestCase):

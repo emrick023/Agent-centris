@@ -262,6 +262,39 @@ def normalize_label(text):
     return re.sub(r"[^a-z0-9']+", " ", text).strip()
 
 
+def address_key(adresse):
+    if not adresse or adresse == "Non indiqué":
+        return ""
+
+    text = decode_html(str(adresse)).lower()
+    text = text.replace("’", "'")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[–—−]", "-", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"[^a-z0-9#'()/-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def row_address_key(row):
+    key = address_key(row.get("Adresse", ""))
+    if key:
+        return key
+    lid = row.get("_id", "")
+    return f"id:{lid}" if lid else ""
+
+
+def normalize_reference(ref):
+    normalized = {}
+    for key, value in ref.items():
+        if isinstance(value, dict):
+            normalized_key = address_key(value.get("adresse", "")) or key
+            normalized[normalized_key] = value
+        else:
+            normalized[key] = value
+    return normalized
+
+
 def carac_value(html, label):
     expected = normalize_label(label)
     pat = re.compile(
@@ -405,23 +438,26 @@ def load_reference(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             ref = json.load(f)
-        print(f"[RÉFÉRENCE] {len(ref)} annonces chargées depuis la veille.")
-        return ref
+        normalized = normalize_reference(ref)
+        print(f"[RÉFÉRENCE] {len(normalized)} annonces chargées depuis la veille.")
+        return normalized
     except Exception as e:
         print(f"[RÉFÉRENCE] Erreur de lecture : {e} — on repart de zéro.")
         return {}
 
 
 def save_reference(rows, path):
-    """Sauvegarde {listing_id: {prix, ville, adresse}} pour le prochain run."""
+    """Sauvegarde {address_key: {adresse, prix, ville, listing_id}} pour demain."""
     ref = {}
     for row in rows:
+        key = row_address_key(row)
         lid = row.get("_id")
-        if lid:
-            ref[lid] = {
+        if key:
+            ref[key] = {
                 "prix":    row.get("Prix", "Non indiqué"),
                 "ville":   row.get("Ville", ""),
                 "adresse": row.get("Adresse", ""),
+                "listing_id": lid,
             }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(ref, f, ensure_ascii=False, indent=2)
@@ -436,11 +472,16 @@ def detect_changements(rows, ref):
     Compare les annonces d'aujourd'hui avec la référence de la veille.
 
     Retourne :
-        nouveaux_ids  : set — IDs absents de ref (nouvelles annonces)
-        retires       : list de dicts {id, adresse, ville} — présents hier, absents aujourd'hui
-        prix_changes  : dict {id: ancien_prix} — ID présent les deux jours, prix différent
+        nouveaux_ids  : set — clés adresse absentes de ref (nouvelles annonces)
+        retires       : list de dicts — adresses présentes hier, absentes aujourd'hui
+        prix_changes  : dict {address_key: ancien_prix} — même adresse, prix différent
     """
-    ids_aujourdhui = {row["_id"] for row in rows if row.get("_id")}
+    rows_by_key = {
+        row_address_key(row): row
+        for row in rows
+        if row_address_key(row)
+    }
+    ids_aujourdhui = set(rows_by_key.keys())
     ids_hier       = set(ref.keys())
 
     nouveaux_ids = ids_aujourdhui - ids_hier
@@ -448,25 +489,25 @@ def detect_changements(rows, ref):
 
     retires = [
         {
-            "id":      lid,
-            "adresse": ref[lid].get("adresse", "Adresse inconnue"),
-            "ville":   ref[lid].get("ville",   ""),
+            "id":         key,
+            "adresse":    ref[key].get("adresse", "Adresse inconnue"),
+            "ville":      ref[key].get("ville",   ""),
+            "listing_id": ref[key].get("listing_id", ""),
         }
-        for lid in retires_ids
+        for key in retires_ids
     ]
 
     prix_changes = {}
-    for row in rows:
-        lid = row.get("_id")
-        if lid and lid in ref:
-            ancien_prix   = ref[lid].get("prix", "Non indiqué")
+    for key, row in rows_by_key.items():
+        if key in ref:
+            ancien_prix   = ref[key].get("prix", "Non indiqué")
             nouveau_prix  = row.get("Prix", "Non indiqué")
             if (
                 ancien_prix != "Non indiqué"
                 and nouveau_prix != "Non indiqué"
                 and ancien_prix != nouveau_prix
             ):
-                prix_changes[lid] = ancien_prix
+                prix_changes[key] = ancien_prix
 
     return nouveaux_ids, retires, prix_changes
 
@@ -566,8 +607,8 @@ PRIX_COL_IDX = COLONNES.index("Prix") + 1   # index 1-based dans Excel
 def save_excel(rows, path, nouveaux_ids=None, prix_changes=None):
     """
     Génère le fichier Excel.
-    - Ligne verte   (#C6EFCE) si ID dans nouveaux_ids
-    - Ligne jaune   (#FFEB9C) + cellule Prix orange (#FF6600 bold) si ID dans prix_changes
+    - Ligne verte   (#C6EFCE) si l'adresse est dans nouveaux_ids
+    - Ligne jaune   (#FFEB9C) + cellule Prix orange (#FF6600 bold) si l'adresse est dans prix_changes
     """
     nouveaux_ids = nouveaux_ids or set()
     prix_changes  = prix_changes  or {}
@@ -596,12 +637,12 @@ def save_excel(rows, path, nouveaux_ids=None, prix_changes=None):
 
     # Données
     for row_idx, row in enumerate(rows, start=2):
-        lid = row.get("_id", "")
+        key = row_address_key(row)
 
         # Déterminer le style de ligne
-        if lid in nouveaux_ids:
+        if key in nouveaux_ids:
             row_fill = fill_nouveau
-        elif lid in prix_changes:
+        elif key in prix_changes:
             row_fill = fill_prix_ligne
         else:
             row_fill = None
@@ -615,7 +656,7 @@ def save_excel(rows, path, nouveaux_ids=None, prix_changes=None):
                 cell.fill = row_fill
 
             # Cellule Prix orange + bold si changement de prix
-            if lid in prix_changes and col_idx == PRIX_COL_IDX:
+            if key in prix_changes and col_idx == PRIX_COL_IDX:
                 cell.fill = fill_prix_cell
                 cell.font = Font(bold=True, color="FFFFFF")
 
@@ -801,7 +842,7 @@ def main(reset_reference=False):
 
     # Étape 4 : générer l'Excel (annonces actives uniquement — retirées exclues)
     print("\n[ÉTAPE 4] Génération du fichier Excel...")
-    rows_actifs = [r for r in rows if r.get("_id") not in {r2["id"] for r2 in retires}]
+    rows_actifs = rows
     save_excel(rows_actifs, OUTPUT_PATH, nouveaux_ids, prix_changes)
 
     # Étape 5 : sauvegarder la nouvelle référence

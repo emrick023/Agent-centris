@@ -46,9 +46,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: listing_ids_precedents.json
-          key: listing-ref-v2-${{ github.run_id }}
+          key: listing-ref-v3-${{ github.run_id }}
           restore-keys: |
-            listing-ref-v2-
+            listing-ref-v3-
 
       # 5. Lancer l'extraction + détection des changements + email conditionnel
       - name: Lancer extraction_50km.py
@@ -74,4 +74,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: listing_ids_precedents.json
-          key: listing-ref-v2-${{ github.run_id }}
+          key: listing-ref-v3-${{ github.run_id }}
